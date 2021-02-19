@@ -67,5 +67,8 @@
   },
   "workspaces": [
     "packages/*"
-  ]
+  ],
+  "dependencies": {
+    "nodemailer": "^6.4.18"
+  }
 }

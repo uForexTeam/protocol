@@ -4,7 +4,7 @@ require("dotenv").config();
 const retry = require("async-retry");
 
 // Helpers
-const { MAX_UINT_VAL, findContractVersion, SUPPORTED_CONTRACT_VERSIONS } = require("@uma/common");
+const { findContractVersion, SUPPORTED_CONTRACT_VERSIONS } = require("@uma/common");
 
 // JS libs
 const { Disputer } = require("./src/disputer");
@@ -42,10 +42,10 @@ async function run({
   errorRetriesTimeout,
   priceFeedConfig,
   disputerConfig,
-  disputerOverridePrice
+  disputerOverridePrice,
+  alertConfig // Send alert for disputable position
 }) {
   try {
-    const { toBN } = web3.utils;
     const getTime = () => Math.round(new Date().getTime() / 1000);
 
     // If pollingDelay === 0 then the bot is running in serverless mode and should send a `debug` level log.
@@ -103,11 +103,11 @@ async function run({
 
     const collateralToken = new web3.eth.Contract(getAbi("ExpandedERC20"), collateralTokenAddress);
     const syntheticToken = new web3.eth.Contract(getAbi("ExpandedERC20"), syntheticTokenAddress);
-    const [priceIdentifier, currentAllowance, collateralDecimals, syntheticDecimals] = await Promise.all([
+    const [priceIdentifier, collateralDecimals, syntheticDecimals, collateralSymbol] = await Promise.all([
       financialContract.methods.priceIdentifier().call(),
-      collateralToken.methods.allowance(accounts[0], financialContractAddress).call(),
       collateralToken.methods.decimals().call(),
-      syntheticToken.methods.decimals().call()
+      syntheticToken.methods.decimals().call(),
+      collateralToken.methods.symbol().call()
     ]);
 
     const priceFeed = await createReferencePriceFeedForFinancialContract(
@@ -149,7 +149,12 @@ async function run({
       priceFeed,
       account: accounts[0],
       financialContractProps,
-      disputerConfig
+      disputerConfig,
+      financialContractAddress,
+      collateralSymbol,
+      collateralDecimals,
+      syntheticDecimals,
+      alertConfig
     });
 
     logger.debug({
@@ -162,28 +167,12 @@ async function run({
       disputerConfig
     });
 
-    // The Financial Contract requires approval to transfer the disputer's collateral tokens in order to dispute a liquidation.
-    // We'll set this once to the max value and top up whenever the bot's allowance drops below MAX_INT / 2.
-    if (toBN(currentAllowance).lt(toBN(MAX_UINT_VAL).div(toBN("2")))) {
-      await gasEstimator.update();
-      const collateralApprovalTx = await collateralToken.methods.approve(financialContractAddress, MAX_UINT_VAL).send({
-        from: accounts[0],
-        gasPrice: gasEstimator.getCurrentFastPrice()
-      });
-      logger.info({
-        at: "Disputer#index",
-        message: "Approved Financial Contract to transfer unlimited collateral tokens 💰",
-        collateralApprovalTx: collateralApprovalTx.transactionHash
-      });
-    }
-
     // Create a execution loop that will run indefinitely (or yield early if in serverless mode)
     for (;;) {
       await retry(
         async () => {
           await disputer.update();
           await disputer.dispute(disputerOverridePrice);
-          await disputer.withdrawRewards();
         },
         {
           retries: errorRetries,
@@ -254,7 +243,8 @@ async function Poll(callback) {
       disputerConfig: process.env.DISPUTER_CONFIG ? JSON.parse(process.env.DISPUTER_CONFIG) : null,
       // If there is a DISPUTER_OVERRIDE_PRICE environment variable then the disputer will disregard the price from the
       // price feed and preform disputes at this override price. Use with caution as wrong input could cause invalid disputes.
-      disputerOverridePrice: process.env.DISPUTER_OVERRIDE_PRICE
+      disputerOverridePrice: process.env.DISPUTER_OVERRIDE_PRICE,
+      alertConfig: process.env.ALERT_CONFIG ? JSON.parse(process.env.ALERT_CONFIG) : null
     };
 
     await run({ logger: Logger, web3: getWeb3(), ...executionParameters });
