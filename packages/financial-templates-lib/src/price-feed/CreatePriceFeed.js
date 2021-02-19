@@ -2,6 +2,7 @@ const assert = require("assert");
 const { ChainId, Token, Pair, TokenAmount } = require("@uniswap/sdk");
 const { MedianizerPriceFeed } = require("./MedianizerPriceFeed");
 const { CryptoWatchPriceFeed } = require("./CryptoWatchPriceFeed");
+const { DefiPulseTotalPriceFeed } = require("./DefiPulseTotalPriceFeed");
 const { UniswapPriceFeed } = require("./UniswapPriceFeed");
 const { BalancerPriceFeed } = require("./BalancerPriceFeed");
 const { DominationFinancePriceFeed } = require("./DominationFinancePriceFeed");
@@ -12,11 +13,14 @@ const { TraderMadePriceFeed } = require("./TraderMadePriceFeed");
 const { PriceFeedMockScaled } = require("./PriceFeedMockScaled");
 const { InvalidPriceFeedMock } = require("./InvalidPriceFeedMock");
 const { defaultConfigs } = require("./DefaultPriceFeedConfigs");
-const { getTruffleContract } = require("@uma/core");
+const { getTruffleContract, getAbi } = require("@uma/core");
 const { ExpressionPriceFeed, math, escapeSpecialCharacters } = require("./ExpressionPriceFeed");
+const { VaultPriceFeed } = require("./VaultPriceFeed");
+const { BlockFinder } = require("./utils");
 
 async function createPriceFeed(logger, web3, networker, getTime, config) {
   const Uniswap = getTruffleContract("Uniswap", web3, "latest");
+  const ERC20 = getTruffleContract("ExpandedERC20", web3, "latest");
   const Balancer = getTruffleContract("Balancer", web3, "latest");
 
   if (config.type === "cryptowatch") {
@@ -87,14 +91,37 @@ async function createPriceFeed(logger, web3, networker, getTime, config) {
     return new UniswapPriceFeed(
       logger,
       Uniswap.abi,
+      ERC20.abi,
       web3,
       config.uniswapAddress,
       config.twapLength,
       config.lookback,
       getTime,
       config.invertPrice, // Not checked in config because this parameter just defaults to false.
-      config.poolDecimals,
       config.priceFeedDecimals // This defaults to 18 unless supplied by user
+    );
+  } else if (config.type === "defipulsetvl") {
+    const requiredFields = ["lookback", "minTimeBetweenUpdates", "apiKey"];
+
+    if (isMissingField(config, requiredFields, logger)) {
+      return null;
+    }
+
+    logger.debug({
+      at: "createPriceFeed",
+      message: "Creating DefiPulseTotalPriceFeed",
+      config
+    });
+
+    return new DefiPulseTotalPriceFeed(
+      logger,
+      web3,
+      config.apiKey,
+      config.lookback,
+      networker,
+      getTime,
+      config.minTimeBetweenUpdates,
+      config.priceFeedDecimals
     );
   } else if (config.type === "medianizer") {
     const requiredFields = ["medianizedFeeds"];
@@ -284,6 +311,27 @@ async function createPriceFeed(logger, web3, networker, getTime, config) {
     });
 
     return await _createExpressionPriceFeed(config);
+  } else if (config.type === "vault") {
+    const requiredFields = ["address"];
+    if (isMissingField(config, requiredFields, logger)) {
+      return null;
+    }
+
+    logger.debug({
+      at: "createPriceFeed",
+      message: "Creating VaultPriceFeed",
+      config
+    });
+
+    return new VaultPriceFeed({
+      ...config,
+      logger,
+      web3,
+      vaultAbi: getAbi("VaultInterface", "latest"),
+      erc20Abi: getAbi("IERC20Standard", "latest"),
+      vaultAddress: config.address,
+      blockFinder: getSharedBlockFinder(web3)
+    });
   }
 
   logger.error({
@@ -383,6 +431,15 @@ async function createPriceFeed(logger, web3, networker, getTime, config) {
   async function _createBasketOfMedianizerPriceFeeds(medianizerConfigs) {
     return await Promise.all(medianizerConfigs.map(config => _createMedianizerPriceFeed(config)));
   }
+}
+
+// Simple function to grab a singleton instance of the blockFinder to share the cache.
+function getSharedBlockFinder(web3) {
+  // Attach the blockFinder to this function.
+  if (!getSharedBlockFinder.blockFinder) {
+    getSharedBlockFinder.blockFinder = BlockFinder(web3.eth.getBlock);
+  }
+  return getSharedBlockFinder.blockFinder;
 }
 
 function isMissingField(config, requiredFields, logger) {
