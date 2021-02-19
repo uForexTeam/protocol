@@ -134,7 +134,7 @@ class TraderMadePriceFeed extends PriceFeedInterface {
     return this.lastUpdateTime;
   }
 
-  getMinuteLookback() {
+  getLookback() {
     return this.minuteLookback;
   }
 

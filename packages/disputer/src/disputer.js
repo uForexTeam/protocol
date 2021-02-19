@@ -4,6 +4,8 @@ const {
   createObjectFromDefaultProps
 } = require("@uma/common");
 
+const nodemailer = require("nodemailer");
+
 class Disputer {
   /**
    * @notice Constructs new Disputer bot.
@@ -25,7 +27,12 @@ class Disputer {
     priceFeed,
     account,
     financialContractProps,
-    disputerConfig
+    disputerConfig,
+    financialContractAddress,
+    collateralSymbol,
+    collateralDecimals,
+    syntheticDecimals,
+    alertConfig
   }) {
     this.logger = logger;
     this.account = account;
@@ -54,6 +61,12 @@ class Disputer {
     // Multiplier applied to Truffle's estimated gas limit for a transaction to send.
     this.GAS_LIMIT_BUFFER = 1.25;
 
+    this.financialContractAddress = financialContractAddress;
+    this.collateralSymbol = collateralSymbol;
+    this.collateralDecimals = collateralDecimals;
+    this.syntheticDecimals = syntheticDecimals;
+    // Alert to send email notification
+    this.alertConfig = alertConfig;
     // Default config settings. Disputer deployer can override these settings by passing in new
     // values via the `disputerConfig` input object. The `isValid` property is a function that should be called
     // before resetting any config settings. `isValid` must return a Boolean.
@@ -170,73 +183,7 @@ class Disputer {
     }
 
     for (const disputeableLiquidation of disputableLiquidationsWithPrices) {
-      // Create the transaction.
-      const dispute = this.financialContract.methods.dispute(disputeableLiquidation.id, disputeableLiquidation.sponsor);
-
-      // Simple version of inventory management: simulate the transaction and assume that if it fails, the caller didn't have enough collateral.
-      let totalPaid, gasEstimation;
-      try {
-        [totalPaid, gasEstimation] = await Promise.all([
-          dispute.call({ from: this.account }),
-          dispute.estimateGas({ from: this.account })
-        ]);
-      } catch (error) {
-        this.logger.error({
-          at: "Disputer",
-          message: "Cannot dispute liquidation: not enough collateral (or large enough approval) to initiate dispute✋",
-          disputer: this.account,
-          sponsor: disputeableLiquidation.sponsor,
-          liquidation: disputeableLiquidation,
-          totalPaid,
-          error
-        });
-        continue;
-      }
-
-      const txnConfig = {
-        from: this.account,
-        gas: Math.min(Math.floor(gasEstimation * this.GAS_LIMIT_BUFFER), this.txnGasLimit),
-        gasPrice: this.gasEstimator.getCurrentFastPrice()
-      };
-
-      const inputPrice = disputeableLiquidation.price;
-
-      this.logger.debug({
-        at: "Disputer",
-        message: "Disputing liquidation",
-        liquidation: disputeableLiquidation,
-        inputPrice,
-        txnConfig
-      });
-
-      // Send the transaction or report failure.
-      let receipt;
-      try {
-        receipt = await dispute.send(txnConfig);
-      } catch (error) {
-        this.logger.error({
-          at: "Disputer",
-          message: "Failed to dispute liquidation🚨",
-          error
-        });
-        continue;
-      }
-
-      const logResult = {
-        tx: receipt.transactionHash,
-        sponsor: receipt.events.LiquidationDisputed.returnValues.sponsor,
-        liquidator: receipt.events.LiquidationDisputed.returnValues.liquidator,
-        id: receipt.events.LiquidationDisputed.returnValues.liquidationId,
-        disputeBondPaid: receipt.events.LiquidationDisputed.returnValues.disputeBondAmount
-      };
-      this.logger.info({
-        at: "Disputer",
-        message: "Position has been disputed!👮‍♂️",
-        liquidation: disputeableLiquidation,
-        inputPrice,
-        txnConfig,
-        disputeResult: logResult
-      });
+      this.sendAlert(disputeableLiquidation);
     }
   }
 
@@ -360,6 +307,47 @@ class Disputer {
         liquidationResult: logResult
       });
     }
+  }
+
+  sendAlert(disputeableLiquidation) {
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: this.alertConfig.user,
+        pass: this.alertConfig.pass
+      }
+    });
+
+    const msg = {
+      URL: "uforex.finance/?address=" + this.financialContractAddress,
+      Sponsor: disputeableLiquidation.sponsor,
+      SyntheticTokens:
+        disputeableLiquidation.numTokens / Math.pow(10, this.syntheticDecimals) +
+        " " +
+        this.web3.utils.hexToUtf8(this.financialContractIdentifier),
+      Collateral:
+        disputeableLiquidation.liquidatedCollateral / Math.pow(10, this.collateralDecimals) +
+        " " +
+        this.collateralSymbol,
+      LiquidationTime: disputeableLiquidation.liquidationTime,
+      Liquidator: disputeableLiquidation.liquidator,
+      Price: disputeableLiquidation.price / Math.pow(10, this.syntheticDecimals)
+    };
+
+    const mailOptions = {
+      from: this.alertConfig.user,
+      to: this.alertConfig.to,
+      subject: "Detected a disputeableLiquidation",
+      text: JSON.stringify(msg, null, 4)
+    };
+
+    transporter.sendMail(mailOptions, function(error, info) {
+      if (error) {
+        console.log(error);
+      } else {
+        console.log("Email send:" + info.response);
+      }
+    });
   }
 }
 

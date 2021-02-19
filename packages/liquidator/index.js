@@ -4,7 +4,7 @@ require("dotenv").config();
 const retry = require("async-retry");
 
 // Helpers
-const { getWeb3, MAX_UINT_VAL, findContractVersion, SUPPORTED_CONTRACT_VERSIONS } = require("@uma/common");
+const { getWeb3, findContractVersion, SUPPORTED_CONTRACT_VERSIONS } = require("@uma/common");
 // JS libs
 const { Liquidator } = require("./src/liquidator");
 const {
@@ -49,10 +49,10 @@ async function run({
   liquidatorConfig,
   liquidatorOverridePrice,
   startingBlock,
-  endingBlock
+  endingBlock,
+  alertConfig // Send alert for liquidatable position
 }) {
   try {
-    const { toBN } = web3.utils;
     const getTime = () => Math.round(new Date().getTime() / 1000);
 
     // If pollingDelay === 0 then the bot is running in serverless mode and should send a `debug` level log.
@@ -148,16 +148,10 @@ async function run({
 
     const collateralToken = new web3.eth.Contract(getAbi("ExpandedERC20"), collateralTokenAddress);
     const syntheticToken = new web3.eth.Contract(getAbi("ExpandedERC20"), syntheticTokenAddress);
-    const [
-      currentCollateralAllowance,
-      currentSyntheticAllowance,
-      collateralDecimals,
-      syntheticDecimals
-    ] = await Promise.all([
-      collateralToken.methods.allowance(accounts[0], financialContractAddress).call(),
-      syntheticToken.methods.allowance(accounts[0], financialContractAddress).call(),
+    const [collateralDecimals, syntheticDecimals, collateralSymbol] = await Promise.all([
       collateralToken.methods.decimals().call(),
-      syntheticToken.methods.decimals().call()
+      syntheticToken.methods.decimals().call(),
+      collateralToken.methods.symbol().call()
     ]);
 
     const financialContractProps = {
@@ -220,7 +214,12 @@ async function run({
       priceFeed,
       account: accounts[0],
       financialContractProps,
-      liquidatorConfig
+      liquidatorConfig,
+      financialContractAddress,
+      collateralSymbol,
+      collateralDecimals,
+      syntheticDecimals,
+      alertConfig
     });
 
     logger.debug({
@@ -232,33 +231,6 @@ async function run({
       priceFeedConfig,
       liquidatorConfig
     });
-
-    // The Financial Contract requires approval to transfer the liquidator's collateral and synthetic tokens in order to liquidate
-    // a position. We'll set this once to the max value and top up whenever the bot's allowance drops below MAX_INT / 2.
-    if (toBN(currentCollateralAllowance).lt(toBN(MAX_UINT_VAL).div(toBN("2")))) {
-      await gasEstimator.update();
-      const collateralApprovalTx = await collateralToken.methods.approve(financialContractAddress, MAX_UINT_VAL).send({
-        from: accounts[0],
-        gasPrice: gasEstimator.getCurrentFastPrice()
-      });
-      logger.info({
-        at: "Liquidator#index",
-        message: "Approved Financial Contract to transfer unlimited collateral tokens 💰",
-        collateralApprovalTx: collateralApprovalTx.transactionHash
-      });
-    }
-    if (toBN(currentSyntheticAllowance).lt(toBN(MAX_UINT_VAL).div(toBN("2")))) {
-      await gasEstimator.update();
-      const syntheticApprovalTx = await syntheticToken.methods.approve(financialContractAddress, MAX_UINT_VAL).send({
-        from: accounts[0],
-        gasPrice: gasEstimator.getCurrentFastPrice()
-      });
-      logger.info({
-        at: "Liquidator#index",
-        message: "Approved Financial Contract to transfer unlimited synthetic tokens 💰",
-        syntheticApprovalTx: syntheticApprovalTx.transactionHash
-      });
-    }
 
     // Create a execution loop that will run indefinitely (or yield early if in serverless mode)
     for (;;) {
@@ -275,8 +247,6 @@ async function run({
             const currentSyntheticBalance = await syntheticToken.methods.balanceOf(accounts[0]).call();
             await liquidator.liquidatePositions(currentSyntheticBalance, liquidatorOverridePrice);
           }
-          // Check for any finished liquidations that can be withdrawn.
-          await liquidator.withdrawRewards();
         },
         {
           retries: errorRetries,
@@ -361,7 +331,8 @@ async function Poll(callback) {
       startingBlock: process.env.STARTING_BLOCK_NUMBER,
       // Block number to search for events to. If set, acts to limit from where the monitor bot will search for events up
       // until. If either startingBlock or endingBlock is not sent, then the bot will search for event.
-      endingBlock: process.env.ENDING_BLOCK_NUMBER
+      endingBlock: process.env.ENDING_BLOCK_NUMBER,
+      alertConfig: process.env.ALERT_CONFIG ? JSON.parse(process.env.ALERT_CONFIG) : null
     };
 
     await run({ logger: Logger, web3: getWeb3(), ...executionParameters });

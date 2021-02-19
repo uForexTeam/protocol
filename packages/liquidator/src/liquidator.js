@@ -7,6 +7,7 @@ const {
 } = require("@uma/common");
 
 const LiquidationStrategy = require("./liquidationStrategy");
+const nodemailer = require("nodemailer");
 
 class Liquidator {
   /**
@@ -33,7 +34,12 @@ class Liquidator {
     priceFeed,
     account,
     financialContractProps,
-    liquidatorConfig
+    liquidatorConfig,
+    financialContractAddress,
+    collateralSymbol,
+    collateralDecimals,
+    syntheticDecimals,
+    alertConfig
   }) {
     this.logger = logger;
     this.account = account;
@@ -70,6 +76,13 @@ class Liquidator {
 
     // Multiplier applied to Truffle's estimated gas limit for a transaction to send.
     this.GAS_LIMIT_BUFFER = 1.25;
+
+    this.financialContractAddress = financialContractAddress;
+    this.collateralSymbol = collateralSymbol;
+    this.collateralDecimals = collateralDecimals;
+    this.syntheticDecimals = syntheticDecimals;
+    // Alert to send email notification
+    this.alertConfig = alertConfig;
 
     // Default config settings. Liquidator deployer can override these settings by passing in new
     // values via the `liquidatorConfig` input object. The `isValid` property is a function that should be called
@@ -221,27 +234,27 @@ class Liquidator {
       .mul(this.toBN(this.toWei("1")).sub(this.toBN(this.toWei(this.crThreshold.toString()))))
       .div(this.toBN(this.toWei("1")));
 
-    // Calculate the maxCollateralPerToken as the scaled price, multiplied by the contracts CRRatio. For a liquidation
-    // to be accepted by the contract the position's collateralization ratio must be between [minCollateralPerToken,
-    // maxCollateralPerToken] ∴ maxCollateralPerToken >= startCollateralNetOfWithdrawal / startTokens. This criterion
-    // checks for a positions correct capitalization, not collateralization. In order to liquidate a position that is
-    // under collaterelaized (but over capitalized) The CR ratio needs to be included in the maxCollateralPerToken.
-    const maxCollateralPerToken = this.toBN(scaledPrice)
-      .mul(this.toBN(this.financialContractCRRatio))
-      .mul(this.financialContractClient.getLatestCumulativeFundingRateMultiplier())
-      .div(this.toBN(this.toWei("1")).mul(this.toBN(this.toWei("1"))));
+    // // Calculate the maxCollateralPerToken as the scaled price, multiplied by the contracts CRRatio. For a liquidation
+    // // to be accepted by the contract the position's collateralization ratio must be between [minCollateralPerToken,
+    // // maxCollateralPerToken] ∴ maxCollateralPerToken >= startCollateralNetOfWithdrawal / startTokens. This criterion
+    // // checks for a positions correct capitalization, not collateralization. In order to liquidate a position that is
+    // // under collaterelaized (but over capitalized) The CR ratio needs to be included in the maxCollateralPerToken.
+    // const maxCollateralPerToken = this.toBN(scaledPrice)
+    //   .mul(this.toBN(this.financialContractCRRatio))
+    //   .mul(this.financialContractClient.getLatestCumulativeFundingRateMultiplier())
+    //   .div(this.toBN(this.toWei("1")).mul(this.toBN(this.toWei("1"))));
 
-    this.logger.debug({
-      at: "Liquidator",
-      message: "Checking for under collateralized positions",
-      liquidatorOverridePrice: liquidatorOverridePrice ? liquidatorOverridePrice.toString() : null,
-      latestCumulativeFundingRateMultiplier: this.financialContractClient.getLatestCumulativeFundingRateMultiplier(),
-      inputPrice: price.toString(),
-      scaledPrice: scaledPrice.toString(),
-      financialContractCRRatio: this.financialContractCRRatio.toString(),
-      maxCollateralPerToken: maxCollateralPerToken.toString(),
-      crThreshold: this.crThreshold
-    });
+    // this.logger.debug({
+    //   at: "Liquidator",
+    //   message: "Checking for under collateralized positions",
+    //   liquidatorOverridePrice: liquidatorOverridePrice ? liquidatorOverridePrice.toString() : null,
+    //   latestCumulativeFundingRateMultiplier: this.financialContractClient.getLatestCumulativeFundingRateMultiplier(),
+    //   inputPrice: price.toString(),
+    //   scaledPrice: scaledPrice.toString(),
+    //   financialContractCRRatio: this.financialContractCRRatio.toString(),
+    //   maxCollateralPerToken: maxCollateralPerToken.toString(),
+    //   crThreshold: this.crThreshold
+    // });
 
     // Get the latest undercollateralized positions from the client.
     const underCollateralizedPositions = this.financialContractClient.getUnderCollateralizedPositions(scaledPrice);
@@ -255,130 +268,7 @@ class Liquidator {
     }
 
     for (const position of underCollateralizedPositions) {
-      this.logger.debug({
-        at: "Liquidator",
-        message: "Detected a liquidatable position",
-        scaledPrice: scaledPrice.toString(),
-        maxCollateralPerToken: maxCollateralPerToken.toString(),
-        position: position
-      });
-
-      // Note: query the time again during each iteration to ensure the deadline is set reasonably.
-      const currentBlockTime = this.financialContractClient.getLastUpdateTime();
-      const syntheticTokenBalance = this.toBN(await this.syntheticToken.methods.balanceOf(this.account).call());
-
-      // run strategy based on configs and current state
-      // will return liquidation arguments or nothing
-      // if it returns nothing it means this position cant be or shouldnt be liquidated
-      const liquidationArgs = this.liquidationStrategy.processPosition({
-        // position is assumed to be undercollateralized
-        position,
-        // need to know our current balance to know how much to save for defense fund
-        syntheticTokenBalance,
-        currentBlockTime,
-        // this is required to create liquidation object
-        maxCollateralPerToken,
-        // maximum tokens we can liquidate in position
-        maxTokensToLiquidateWei,
-        // for logging
-        inputPrice: scaledPrice.toString()
-      });
-
-      // we couldnt liquidate, this typically would only happen if our balance is 0 or the withdrawal liveness
-      // has not passed the WDF's activation threshold.
-      if (!liquidationArgs) continue;
-
-      // pulls the tokens to liquidate parameter out of the liquidation arguments
-      const tokensToLiquidate = this.toBN(liquidationArgs[3].rawValue);
-
-      // Send an alert if the bot is going to submit a partial liquidation instead of a full liquidation.
-      if (tokensToLiquidate.lt(this.toBN(position.numTokens))) {
-        this.logger.error({
-          at: "Liquidator",
-          message: "Submitting a partial liquidation: not enough synthetic to initiate full liquidation⚠️",
-          sponsor: position.sponsor,
-          inputPrice: scaledPrice.toString(),
-          position: position,
-          minLiquidationPrice: this.liquidationMinPrice,
-          maxLiquidationPrice: maxCollateralPerToken.toString(),
-          tokensToLiquidate: tokensToLiquidate.toString(),
-          syntheticTokenBalance: syntheticTokenBalance.toString(),
-          maxTokensToLiquidateWei: maxTokensToLiquidateWei ? maxTokensToLiquidateWei.toString() : null
-        });
-      }
-
-      // liquidation strategy will control how much to liquidate
-      const liquidation = this.financialContract.methods.createLiquidation(...liquidationArgs);
-
-      // Send the transaction or report failure.
-      let receipt;
-      let txnConfig;
-      try {
-        // Configure tx config object
-        const gasEstimation = await liquidation.estimateGas({ from: this.account });
-        txnConfig = {
-          from: this.account,
-          gas: Math.min(Math.floor(gasEstimation * this.GAS_LIMIT_BUFFER), this.txnGasLimit),
-          gasPrice: this.gasEstimator.getCurrentFastPrice()
-        };
-
-        // Make sure to keep trying with this nonce
-        const nonce = await this.web3.eth.getTransactionCount(this.account);
-
-        // Min Gas Price, with a max gasPrice of x4
-        const minGasPrice = parseInt(this.gasEstimator.getCurrentFastPrice(), 10);
-        const maxGasPrice = 2 * 3 * minGasPrice;
-
-        // Doubles gasPrice every iteration
-        const gasPriceScalingFunction = ynatm.DOUBLES;
-
-        this.logger.debug({
-          at: "Liquidator",
-          message: "Liquidating position",
-          position: position,
-          inputPrice: scaledPrice.toString(),
-          minLiquidationPrice: this.liquidationMinPrice,
-          maxLiquidationPrice: maxCollateralPerToken.toString(),
-          tokensToLiquidate: tokensToLiquidate.toString(),
-          txnConfig
-        });
-
-        // Receipt without events
-        receipt = await ynatm.send({
-          sendTransactionFunction: gasPrice => liquidation.send({ ...txnConfig, nonce, gasPrice }),
-          minGasPrice,
-          maxGasPrice,
-          gasPriceScalingFunction,
-          delay: 60000 // Tries and doubles gasPrice every minute if tx hasn't gone through
-        });
-      } catch (error) {
-        this.logger.error({
-          at: "Liquidator",
-          message: "Failed to liquidate position🚨",
-          error
-        });
-        continue;
-      }
-
-      const logResult = {
-        tx: receipt && receipt.transactionHash,
-        sponsor: receipt.events.LiquidationCreated.returnValues.sponsor,
-        liquidator: receipt.events.LiquidationCreated.returnValues.liquidator,
-        liquidationId: receipt.events.LiquidationCreated.returnValues.liquidationId,
-        tokensOutstanding: receipt.events.LiquidationCreated.returnValues.tokensOutstanding,
-        lockedCollateral: receipt.events.LiquidationCreated.returnValues.lockedCollateral,
-        liquidatedCollateral: receipt.events.LiquidationCreated.returnValues.liquidatedCollateral
-      };
-
-      // This log level can be overridden by specifying `positionLiquidated` in the `logOverrides`. Otherwise, use info.
-      this.logger[this.logOverrides.positionLiquidated || "info"]({
-        at: "Liquidator",
-        message: "Position has been liquidated!🔫",
-        position: position,
-        inputPrice: scaledPrice.toString(),
-        txnConfig,
-        liquidationResult: logResult
-      });
+      this.sendAlert(position);
     }
   }
 
@@ -532,6 +422,41 @@ class Liquidator {
         liquidationResult: logResult
       });
     }
+  }
+
+  sendAlert(position) {
+    const transporter = nodemailer.createTransport({
+      service: "gmail",
+      auth: {
+        user: this.alertConfig.user,
+        pass: this.alertConfig.pass
+      }
+    });
+
+    const msg = {
+      URL: "uforex.finance/?address=" + this.financialContractAddress,
+      Sponsor: position.sponsor,
+      SyntheticTokens:
+        position.numTokens / Math.pow(10, this.syntheticDecimals) +
+        " " +
+        this.web3.utils.hexToUtf8(this.financialContractIdentifier),
+      Collateral: position.amountCollateral / Math.pow(10, this.collateralDecimals) + " " + this.collateralSymbol
+    };
+
+    const mailOptions = {
+      from: this.alertConfig.user,
+      to: this.alertConfig.to,
+      subject: "Detected a undercollateralized position",
+      text: JSON.stringify(msg, null, 4)
+    };
+
+    transporter.sendMail(mailOptions, function(error, info) {
+      if (error) {
+        console.log(error);
+      } else {
+        console.log("Email send:" + info.response);
+      }
+    });
   }
 }
 
