@@ -1,6 +1,8 @@
 const { PriceFeedInterface } = require("./PriceFeedInterface");
 const { BlockFinder } = require("./utils");
 const { ConvertDecimals } = require("@uma/common");
+const assert = require("assert");
+
 class VaultPriceFeed extends PriceFeedInterface {
   /**
    * @notice Constructs new price feed object that tracks the share price of a yearn-style vault.
@@ -29,6 +31,15 @@ class VaultPriceFeed extends PriceFeedInterface {
     priceFeedDecimals = 18
   }) {
     super();
+
+    // Assert required inputs.
+    assert(logger, "logger required");
+    assert(vaultAbi, "vaultAbi required");
+    assert(erc20Abi, "erc20Abi required");
+    assert(web3, "web3 required");
+    assert(vaultAddress, "vaultAddress required");
+    assert(getTime, "getTime required");
+
     this.logger = logger;
     this.web3 = web3;
 
@@ -79,7 +90,7 @@ class VaultPriceFeed extends PriceFeedInterface {
   async _convertDecimals(value) {
     if (!this.cachedConvertDecimalsFn) {
       const underlyingTokenAddress = await this.vault.methods.token().call();
-      const underlyingToken = new web3.eth.Contract(this.erc20Abi, underlyingTokenAddress);
+      const underlyingToken = new this.web3.eth.Contract(this.erc20Abi, underlyingTokenAddress);
 
       let underlyingTokenDecimals;
       try {
