@@ -213,6 +213,11 @@ class TraderMadePriceFeed extends PriceFeedInterface {
     // 2. Send requests.
     const priceResponse = await this.networker.getJson(priceUrl);
 
+    // 3. Check responses.
+    if (!priceResponse || priceResponse.quotes.length === 0 || !priceResponse.quotes[0]?.ask) {
+      throw new Error(`🚨Could not parse live price result from url ${priceUrl}: ${JSON.stringify(priceResponse)}`);
+    }
+
     // 4. Parse results.
     // Return data structure:
     //  {
